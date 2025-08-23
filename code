@@ -1,0 +1,553 @@
+import cv2
+import face_recognition
+import os
+import csv
+import datetime
+import numpy as np
+from pathlib import Path
+import threading
+import time
+
+class AttendanceSystem:
+    def __init__(self, faces_folder="faces", attendance_file="출석부.csv", 
+                 attendance_deadline="09:30", late_deadline="10:00"):
+        self.faces_folder = faces_folder
+        self.attendance_file = attendance_file
+        self.attendance_deadline = attendance_deadline  # 출석 마감시간 "HH:MM"
+        self.late_deadline = late_deadline  # 지각 마감시간 "HH:MM"
+        self.known_encodings = []
+        self.known_names = []
+        
+        # 상태별로 분리된 출석 관리
+        self.present_members = set()  # 정시 출석자
+        self.late_members = set()     # 지각자
+        self.absent_members = set()   # 결석자 (마감 후 출석한 사람)
+        self.all_checked = set()      # 모든 출석 체크 완료자 (중복 방지용)
+        
+        self.cap = None
+        self.running = False
+        self.attendance_deadline_passed = False
+        self.late_deadline_passed = False
+        
+        # 얼굴 데이터 로드
+        self.load_known_faces()
+        
+        # CSV 파일 초기화
+        self.init_csv_file()
+        
+        # 키 입력을 감지하기 위한 변수
+        self.key_pressed = False
+        
+        # 마감시간들 설정
+        self.set_deadlines()
+        
+        # 실시간 업데이트를 위한 마지막 업데이트 시간
+        self.last_update_time = time.time()
+    
+    def set_deadlines(self):
+        """두 개의 마감 시간 설정"""
+        try:
+            # 출석 마감시간
+            att_hour, att_minute = map(int, self.attendance_deadline.split(':'))
+            today = datetime.date.today()
+            self.attendance_deadline_dt = datetime.datetime.combine(
+                today, 
+                datetime.time(att_hour, att_minute)
+            )
+            
+            # 지각 마감시간
+            late_hour, late_minute = map(int, self.late_deadline.split(':'))
+            self.late_deadline_dt = datetime.datetime.combine(
+                today, 
+                datetime.time(late_hour, late_minute)
+            )
+            
+            # 시간 순서 확인
+            if self.attendance_deadline_dt >= self.late_deadline_dt:
+                raise ValueError("지각 마감시간은 출석 마감시간보다 늦어야 합니다.")
+            
+            print(f"📅 출석 마감: {self.attendance_deadline_dt.strftime('%H:%M')}")
+            print(f"⏰ 지각 마감: {self.late_deadline_dt.strftime('%H:%M')}")
+            print(f"❌ {self.late_deadline}이후: 결석 처리")
+            
+        except ValueError as e:
+            print(f"시간 설정 오류: {e}")
+            print("기본값을 사용합니다. (출석: 09:30, 지각: 10:00)")
+            today = datetime.date.today()
+            self.attendance_deadline_dt = datetime.datetime.combine(today, datetime.time(9, 30))
+            self.late_deadline_dt = datetime.datetime.combine(today, datetime.time(10, 0))
+    
+    def get_current_status(self):
+        """현재 시간 기준으로 상태 반환"""
+        now = datetime.datetime.now()
+        if now <= self.attendance_deadline_dt:
+            return "attendance_time"  # 출석 시간
+        elif now <= self.late_deadline_dt:
+            return "late_time"  # 지각 시간
+        else:
+            return "absent_time"  # 결석 시간
+    
+    def get_time_remaining(self):
+        """다음 마감까지 남은 시간 반환"""
+        now = datetime.datetime.now()
+        
+        if now <= self.attendance_deadline_dt:
+            remaining = self.attendance_deadline_dt - now
+            target = "출석 마감"
+        elif now <= self.late_deadline_dt:
+            remaining = self.late_deadline_dt - now
+            target = "지각 마감"
+        else:
+            return "모든 마감 종료"
+        
+        hours = remaining.seconds // 3600
+        minutes = (remaining.seconds % 3600) // 60
+        
+        if remaining.days < 0:
+            return "마감됨"
+        elif remaining.days > 0:
+            return f"{target}까지 {remaining.days}일 {hours:02d}:{minutes:02d}"
+        else:
+            return f"{target}까지 {hours:02d}:{minutes:02d}"
+    
+    def load_known_faces(self):
+        """faces 폴더에서 얼굴 이미지를 로드하고 인코딩"""
+        print("얼굴 데이터를 로드 중...")
+        
+        if not os.path.exists(self.faces_folder):
+            print(f"'{self.faces_folder}' 폴더가 존재하지 않습니다.")
+            return
+        
+        # 지원하는 이미지 확장자
+        image_extensions = ['.jpg', '.jpeg', '.png', '.bmp']
+        
+        for filename in os.listdir(self.faces_folder):
+            file_path = os.path.join(self.faces_folder, filename)
+            
+            # 이미지 파일인지 확인
+            if not any(filename.lower().endswith(ext) for ext in image_extensions):
+                continue
+            
+            try:
+                # 이미지 로드
+                image = face_recognition.load_image_file(file_path)
+                
+                # 얼굴 인코딩 (첫 번째 얼굴만 사용)
+                encodings = face_recognition.face_encodings(image)
+                
+                if encodings:
+                    encoding = encodings[0]
+                    # 파일명에서 확장자 제거하여 이름 추출
+                    name = Path(filename).stem
+                    
+                    self.known_encodings.append(encoding)
+                    self.known_names.append(name)
+                    print(f"✓ {name} 얼굴 데이터 로드 완료")
+                else:
+                    print(f"✗ {filename}에서 얼굴을 찾을 수 없습니다.")
+                    
+            except Exception as e:
+                print(f"✗ {filename} 로드 실패: {str(e)}")
+        
+        print(f"총 {len(self.known_names)}명의 얼굴 데이터가 로드되었습니다.")
+        print(f"등록된 동아리원: {', '.join(self.known_names)}\n")
+    
+    def init_csv_file(self):
+        """CSV 파일 초기화 (헤더가 없으면 생성)"""
+        if not os.path.exists(self.attendance_file):
+            with open(self.attendance_file, 'w', newline='', encoding='utf-8') as file:
+                writer = csv.writer(file)
+                writer.writerow(['이름', '출석시간', '날짜', '상태'])
+    
+    def mark_attendance(self, name):
+        """출석 기록"""
+        if name not in self.all_checked:
+            now = datetime.datetime.now()
+            date_str = now.strftime("%Y-%m-%d")
+            time_str = now.strftime("%H:%M:%S")
+            
+            # 시간대별 상태 결정
+            current_status = self.get_current_status()
+            
+            if current_status == "attendance_time":
+                status = "출석"
+                self.present_members.add(name)
+                print(f"✅ {name} 출석 완료! ({time_str})")
+            elif current_status == "late_time":
+                status = "지각"
+                self.late_members.add(name)
+                print(f"⚠️ {name} 지각 처리됨! ({time_str})")
+            else:  # absent_time
+                status = "결석"
+                self.absent_members.add(name)
+                print(f"❌ {name} 결석 처리됨! (마감시간 초과 - {time_str})")
+            
+            # CSV 파일에 기록
+            with open(self.attendance_file, 'a', newline='', encoding='utf-8') as file:
+                writer = csv.writer(file)
+                writer.writerow([name, time_str, date_str, status])
+            
+            self.all_checked.add(name)
+            self.update_real_time_display()
+    
+    def get_unchecked_members(self):
+        """아직 체크되지 않은 사람들 반환"""
+        all_members = set(self.known_names)
+        unchecked_members = all_members - self.all_checked
+        return list(unchecked_members)
+    
+    def update_real_time_display(self):
+        """실시간 출석 현황 업데이트"""
+        current_time = time.time()
+        # 5초마다 또는 새로운 출석이 있을 때 업데이트
+        if current_time - self.last_update_time > 5 or len(self.all_checked) > 0:
+            self.print_real_time_status()
+            self.last_update_time = current_time
+    
+    def print_real_time_status(self):
+        """실시간 출석 현황을 콘솔에 출력"""
+        # 콘솔 창 정리 (선택사항)
+        # os.system('cls' if os.name == 'nt' else 'clear')
+        
+        print("\n" + "="*70)
+        print("📊 실시간 출석 현황")
+        print("="*70)
+        
+        total_count = len(self.known_names)
+        checked_count = len(self.all_checked)
+        unchecked_members = self.get_unchecked_members()
+        
+        # 전체 현황
+        print(f"전체: {total_count}명 | 확인완료: {checked_count}명 | 미확인: {len(unchecked_members)}명")
+        print("-" * 70)
+        
+        # 출석자 (정시)
+        if self.present_members:
+            print(f"✅ 출석 ({len(self.present_members)}명): {', '.join(sorted(self.present_members))}")
+        else:
+            print("✅ 출석 (0명): -")
+        
+        # 지각자
+        if self.late_members:
+            print(f"⚠️  지각 ({len(self.late_members)}명): {', '.join(sorted(self.late_members))}")
+        else:
+            print("⚠️  지각 (0명): -")
+        
+        # 결석자 (마감 후 출석)
+        if self.absent_members:
+            print(f"❌ 결석 ({len(self.absent_members)}명): {', '.join(sorted(self.absent_members))}")
+        else:
+            print("❌ 결석 (0명): -")
+        
+        # 미확인자
+        current_status = self.get_current_status()
+        if unchecked_members:
+            if current_status == "absent_time":
+                print(f"🔴 미출석자-결석처리예정 ({len(unchecked_members)}명): {', '.join(sorted(unchecked_members))}")
+            else:
+                print(f"⏳ 미확인자 ({len(unchecked_members)}명): {', '.join(sorted(unchecked_members))}")
+        else:
+            print("⏳ 미확인자 (0명): -")
+        
+        # 현재 시간 정보
+        current_time = datetime.datetime.now().strftime("%H:%M:%S")
+        status_messages = {
+            "attendance_time": f"🟢 현재 출석 시간대 (~ {self.attendance_deadline})",
+            "late_time": f"🟡 현재 지각 시간대 ({self.attendance_deadline} ~ {self.late_deadline})",
+            "absent_time": f"🔴 출석 마감 종료 ({self.late_deadline} 이후)"
+        }
+        print(f"\n🕐 현재 시간: {current_time}")
+        print(f"{status_messages[current_status]}")
+        print(f"⏳ {self.get_time_remaining()}")
+        print("="*70)
+    
+    def show_attendance_summary(self):
+        """출석 현황 요약 표시"""
+        print("\n" + "="*70)
+        print("📋 최종 출석 현황 요약")
+        print("="*70)
+        
+        total_count = len(self.known_names)
+        checked_count = len(self.all_checked)
+        unchecked_members = self.get_unchecked_members()
+        current_status = self.get_current_status()
+        
+        print(f"총 동아리원: {total_count}명")
+        print(f"출석 체크 완료: {checked_count}명")
+        print(f"미확인: {len(unchecked_members)}명")
+        print("-" * 70)
+        
+        # 최종 통계
+        print(f"✅ 출석: {len(self.present_members)}명")
+        print(f"⚠️  지각: {len(self.late_members)}명") 
+        print(f"❌ 결석: {len(self.absent_members)}명")
+        
+        # 상세 명단
+        if self.present_members:
+            print(f"\n✅ 출석자: {', '.join(sorted(self.present_members))}")
+        
+        if self.late_members:
+            print(f"⚠️  지각자: {', '.join(sorted(self.late_members))}")
+            
+        if self.absent_members:
+            print(f"❌ 결석자(마감후출석): {', '.join(sorted(self.absent_members))}")
+        
+        if unchecked_members:
+            if current_status == "absent_time":
+                print(f"🔴 미출석자(결석처리): {', '.join(sorted(unchecked_members))}")
+                # 지각 마감 시간이 지났으면 미출석자를 CSV에 결석으로 기록
+                self.mark_absent_members(unchecked_members)
+            else:
+                print(f"⏳ 미확인자: {', '.join(sorted(unchecked_members))}")
+        
+        print("="*70)
+    
+    def mark_absent_members(self, absent_members):
+        """미출석자를 CSV에 결석으로 기록"""
+        now = datetime.datetime.now()
+        date_str = now.strftime("%Y-%m-%d")
+        
+        with open(self.attendance_file, 'a', newline='', encoding='utf-8') as file:
+            writer = csv.writer(file)
+            for member in absent_members:
+                if member not in self.all_checked:  # 중복 방지
+                    writer.writerow([member, "-", date_str, "결석"])
+    
+    def deadline_monitor(self):
+        """마감 시간 모니터링 및 실시간 업데이트 스레드"""
+        while self.running:
+            current_status = self.get_current_status()
+            
+            # 출석 마감 알림
+            if not self.attendance_deadline_passed and current_status != "attendance_time":
+                self.attendance_deadline_passed = True
+                print(f"\n⏰ 출석 마감시간({self.attendance_deadline})이 지났습니다!")
+                print(f"🟡 지각 시간대 시작 - {self.late_deadline}까지 지각으로 처리됩니다.")
+                self.print_real_time_status()
+            
+            # 지각 마감 알림
+            if not self.late_deadline_passed and current_status == "absent_time":
+                self.late_deadline_passed = True
+                print(f"\n🚨 지각 마감시간({self.late_deadline})이 지났습니다!")
+                print("🔴 이제부터 출석 체크 시 결석으로 처리됩니다.")
+                self.print_real_time_status()
+            
+            # 10초마다 실시간 현황 업데이트
+            self.update_real_time_display()
+            time.sleep(10)
+    
+    def key_listener(self):
+        """키 입력을 감지하는 스레드"""
+        while self.running:
+            try:
+                user_input = input().strip().lower()
+                if user_input == "":  # Enter 키
+                    self.key_pressed = True
+                    break
+                elif user_input == "status":  # 현재 상황 확인
+                    self.print_real_time_status()
+                elif user_input == "time":  # 시간 정보
+                    current_time = datetime.datetime.now().strftime("%H:%M:%S")
+                    print(f"\n🕐 현재 시간: {current_time}")
+                    print(f"⏳ {self.get_time_remaining()}")
+                elif user_input == "summary":  # 최종 요약
+                    self.show_attendance_summary()
+                elif user_input == "help":  # 도움말
+                    print("\n📖 명령어:")
+                    print("  Enter     - 프로그램 종료")
+                    print("  status    - 실시간 출석 현황")
+                    print("  time      - 현재 시간 및 남은 시간")
+                    print("  summary   - 최종 출석 요약")
+                    print("  help      - 이 도움말 표시")
+            except:
+                break
+    
+    def run(self):
+        """메인 실행 함수"""
+        if not self.known_names:
+            print("등록된 얼굴 데이터가 없습니다.")
+            return
+        
+        # 카메라 초기화
+        self.cap = cv2.VideoCapture(0)
+        if not self.cap.isOpened():
+            print("카메라를 열 수 없습니다.")
+            return
+        
+        print("🎯 실시간 얼굴 인식 출석 체크 시스템 시작!")
+        print(f"📅 오늘 날짜: {datetime.date.today()}")
+        print(f"⏳ {self.get_time_remaining()}")
+        print("\n💡 명령어:")
+        print("  Enter     - 프로그램 종료")
+        print("  status    - 실시간 출석 현황")
+        print("  time      - 시간 정보")
+        print("  summary   - 최종 출석 요약")
+        print("  help      - 도움말 표시")
+        print("-" * 50)
+        
+        # 초기 현황 출력
+        self.print_real_time_status()
+        
+        self.running = True
+        
+        # 마감 시간 모니터링 및 실시간 업데이트 스레드 시작
+        deadline_thread = threading.Thread(target=self.deadline_monitor, daemon=True)
+        deadline_thread.start()
+        
+        # 키 입력 감지 스레드 시작
+        key_thread = threading.Thread(target=self.key_listener, daemon=True)
+        key_thread.start()
+        
+        # 얼굴 감지 처리 속도 향상을 위한 변수
+        process_this_frame = True
+        
+        while self.running and not self.key_pressed:
+            ret, frame = self.cap.read()
+            if not ret:
+                print("카메라에서 프레임을 가져올 수 없습니다.")
+                break
+            
+            # 처리 속도 향상을 위해 매 프레임마다 처리하지 않음
+            if process_this_frame:
+                # 프레임 크기를 줄여서 처리 속도 향상
+                small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
+                rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+                
+                # 얼굴 위치와 인코딩 찾기
+                face_locations = face_recognition.face_locations(rgb_small_frame)
+                face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
+                
+                face_names = []
+                for face_encoding in face_encodings:
+                    # 알려진 얼굴과 비교
+                    matches = face_recognition.compare_faces(self.known_encodings, face_encoding)
+                    name = "Unknown"
+                    
+                    # 가장 가까운 얼굴 찾기
+                    face_distances = face_recognition.face_distance(self.known_encodings, face_encoding)
+                    best_match_index = np.argmin(face_distances)
+                    
+                    if matches[best_match_index] and face_distances[best_match_index] < 0.6:
+                        name = self.known_names[best_match_index]
+                        # 출석 체크
+                        self.mark_attendance(name)
+                    
+                    face_names.append(name)
+            
+            process_this_frame = not process_this_frame
+            
+            # 결과를 원본 프레임에 표시
+            for (top, right, bottom, left), name in zip(face_locations, face_names):
+                # 좌표를 원본 크기로 복원
+                top *= 4
+                right *= 4
+                bottom *= 4
+                left *= 4
+                
+                # 얼굴 주변에 사각형 그리기
+                color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
+                cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+                
+                # 이름 표시를 위한 배경 사각형
+                cv2.rectangle(frame, (left, bottom - 35), (right, bottom), color, cv2.FILLED)
+                
+                # 이름 텍스트 표시
+                font = cv2.FONT_HERSHEY_DUPLEX
+                cv2.putText(frame, name, (left + 6, bottom - 6), font, 0.8, (255, 255, 255), 1)
+            
+            # 화면 좌측에 실시간 통계 표시
+            info_y = 30
+            
+            # 전체 출석 현황
+            total_text = f"전체: {len(self.all_checked)}/{len(self.known_names)}"
+            cv2.putText(frame, total_text, (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            info_y += 30
+            
+            # 출석자 수
+            present_text = f"출석: {len(self.present_members)}"
+            cv2.putText(frame, present_text, (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            info_y += 25
+            
+            # 지각자 수
+            late_text = f"지각: {len(self.late_members)}"
+            cv2.putText(frame, late_text, (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            info_y += 25
+            
+            # 결석자 수 (마감 후 출석)
+            absent_text = f"결석: {len(self.absent_members)}"
+            cv2.putText(frame, absent_text, (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            info_y += 25
+            
+            # 미확인자 수
+            unchecked_count = len(self.get_unchecked_members())
+            unchecked_text = f"미확인: {unchecked_count}"
+            cv2.putText(frame, unchecked_text, (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
+            info_y += 30
+            
+            # 현재 시간대 표시
+            current_status = self.get_current_status()
+            status_colors = {
+                "attendance_time": (0, 255, 0),  # 초록 - 출석
+                "late_time": (0, 255, 255),      # 노랑 - 지각
+                "absent_time": (0, 0, 255)       # 빨강 - 결석
+            }
+            status_texts = {
+                "attendance_time": "출석 시간",
+                "late_time": "지각 시간",
+                "absent_time": "마감 종료"
+            }
+            
+            status_color = status_colors[current_status]
+            status_display = status_texts[current_status]
+            cv2.putText(frame, f"현재: {status_display}", (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+            info_y += 25
+            
+            # 남은 시간
+            time_remaining = self.get_time_remaining()
+            time_color = (0, 0, 255) if "마감" in time_remaining else (255, 255, 0)
+            cv2.putText(frame, time_remaining, (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, time_color, 2)
+            info_y += 25
+            
+            # 명령어 안내
+            cv2.putText(frame, "콘솔: status,summary,help", (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            
+            # 화면에 표시
+            cv2.imshow('Real-time Face Attendance System', frame)
+            
+            # ESC 키로도 종료 가능
+            if cv2.waitKey(1) & 0xFF == 27:  # ESC key
+                break
+        
+        # 정리 및 최종 요약
+        self.cleanup()
+        self.show_attendance_summary()
+    
+    def cleanup(self):
+        """리소스 정리"""
+        self.running = False
+        if self.cap:
+            self.cap.release()
+        cv2.destroyAllWindows()
+        print(f"\n🏁 프로그램이 종료되었습니다.")
+
+def main():
+    # 설정 - 원하는 마감 시간들을 여기서 변경하세요 (HH:MM 형식)
+    attendance_deadline = "09:30"  # 출석 마감 시간
+    late_deadline = "10:00"        # 지각 마감 시간 (이후는 결석)
+    
+    print("🎯 실시간 얼굴 인식 출석 체크 시스템")
+    print("="*50)
+    print(f"✅ ~ {attendance_deadline}: 출석")
+    print(f"⚠️  {attendance_deadline} ~ {late_deadline}: 지각")
+    print(f"❌ {late_deadline} ~: 결석")
+    print("="*50)
+    
+    # 출석 시스템 실행
+    system = AttendanceSystem(
+        attendance_deadline=attendance_deadline,
+        late_deadline=late_deadline
+    )
+    system.run()
+
+if __name__ == "__main__":
+    main()
