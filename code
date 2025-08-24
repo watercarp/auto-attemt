@@ -7,6 +7,16 @@ import numpy as np
 from pathlib import Path
 import threading
 import time
+from PIL import ImageFont, ImageDraw, Image
+
+font_path = "C:/Windows/Fonts/malgun.ttf"  # 윈도우 기본 한글 폰트
+
+def draw_text_with_pil(img, text, position, font_path, font_size, color):
+    img_pil = Image.fromarray(img)
+    font = ImageFont.truetype(font_path, font_size)
+    draw = ImageDraw.Draw(img_pil)
+    draw.text(position, text, font=font, fill=color)
+    return np.array(img_pil)
 
 class AttendanceSystem:
     def __init__(self, faces_folder="faces", attendance_file="출석부.csv", 
@@ -451,39 +461,40 @@ class AttendanceSystem:
                 # 이름 표시를 위한 배경 사각형
                 cv2.rectangle(frame, (left, bottom - 35), (right, bottom), color, cv2.FILLED)
                 
-                # 이름 텍스트 표시
+                # 이름 텍스트 표시 (영문만, 한글 이름이면 아래에서 Pillow로 표시됨)
                 font = cv2.FONT_HERSHEY_DUPLEX
                 cv2.putText(frame, name, (left + 6, bottom - 6), font, 0.8, (255, 255, 255), 1)
             
-            # 화면 좌측에 실시간 통계 표시
+            # 화면 좌측에 실시간 통계 표시 (Pillow로 한글 지원)
             info_y = 30
-            
+            font_size = 24
+
             # 전체 출석 현황
             total_text = f"전체: {len(self.all_checked)}/{len(self.known_names)}"
-            cv2.putText(frame, total_text, (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            frame = draw_text_with_pil(frame, total_text, (10, info_y), font_path, font_size, (255,255,255))
             info_y += 30
-            
+
             # 출석자 수
             present_text = f"출석: {len(self.present_members)}"
-            cv2.putText(frame, present_text, (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            frame = draw_text_with_pil(frame, present_text, (10, info_y), font_path, font_size, (0,255,0))
             info_y += 25
-            
+
             # 지각자 수
             late_text = f"지각: {len(self.late_members)}"
-            cv2.putText(frame, late_text, (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            frame = draw_text_with_pil(frame, late_text, (10, info_y), font_path, font_size, (0,255,255))
             info_y += 25
-            
+
             # 결석자 수 (마감 후 출석)
             absent_text = f"결석: {len(self.absent_members)}"
-            cv2.putText(frame, absent_text, (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            frame = draw_text_with_pil(frame, absent_text, (10, info_y), font_path, font_size, (0,0,255))
             info_y += 25
-            
+
             # 미확인자 수
             unchecked_count = len(self.get_unchecked_members())
             unchecked_text = f"미확인: {unchecked_count}"
-            cv2.putText(frame, unchecked_text, (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
+            frame = draw_text_with_pil(frame, unchecked_text, (10, info_y), font_path, font_size, (128,128,128))
             info_y += 30
-            
+
             # 현재 시간대 표시
             current_status = self.get_current_status()
             status_colors = {
@@ -496,21 +507,20 @@ class AttendanceSystem:
                 "late_time": "지각 시간",
                 "absent_time": "마감 종료"
             }
-            
             status_color = status_colors[current_status]
             status_display = status_texts[current_status]
-            cv2.putText(frame, f"현재: {status_display}", (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+            frame = draw_text_with_pil(frame, f"현재: {status_display}", (10, info_y), font_path, font_size, status_color)
             info_y += 25
-            
+
             # 남은 시간
             time_remaining = self.get_time_remaining()
             time_color = (0, 0, 255) if "마감" in time_remaining else (255, 255, 0)
-            cv2.putText(frame, time_remaining, (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, time_color, 2)
+            frame = draw_text_with_pil(frame, time_remaining, (10, info_y), font_path, font_size-4, time_color)
             info_y += 25
-            
+
             # 명령어 안내
-            cv2.putText(frame, "콘솔: status,summary,help", (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-            
+            frame = draw_text_with_pil(frame, "콘솔: status,summary,help", (10, info_y), font_path, font_size-8, (255,255,255))
+
             # 화면에 표시
             cv2.imshow('Real-time Face Attendance System', frame)
             
@@ -532,8 +542,8 @@ class AttendanceSystem:
 
 def main():
     # 설정 - 원하는 마감 시간들을 여기서 변경하세요 (HH:MM 형식)
-    attendance_deadline = "09:30"  # 출석 마감 시간
-    late_deadline = "10:00"        # 지각 마감 시간 (이후는 결석)
+    attendance_deadline = "02:30"  # 출석 마감 시간
+    late_deadline = "3:00"        # 지각 마감 시간 (이후는 결석)
     
     print("🎯 실시간 얼굴 인식 출석 체크 시스템")
     print("="*50)
